@@ -1,17 +1,23 @@
 # Niedoprecyzowania i pytania otwarte
 
-Dokument zbiera wszystkie nierozstrzygnięte kwestie, które muszą zostać wyjaśnione przed
-lub w trakcie implementacji trackera GPS na ATtiny.
+Dokument zbiera nierozstrzygnięte kwestie, które muszą zostać wyjaśnione przed
+lub w trakcie implementacji trackera GPS na AVR.
+
+**Rozstrzygnięte decyzje (z rozmowy):**
+- RPi NIE jest częścią docelowego urządzenia — tylko do testów
+- Transmisja danych: karta SIM → HTTP endpoint na serwer
+- Posiadany moduł: SIM800L (2G)
+- Priorytet: niski koszt, minimalna liczba komponentów, niskie zużycie energii
 
 ---
 
-## 1. Wybór mikrokontrolera
+## 1. Wybór MCU
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Który dokładnie ATtiny?** | Obecny kod celuje w ATtiny2313 (2 KB Flash, 128 B RAM, 128 B EEPROM, 1 UART sprzętowy). To bardzo ograniczone zasoby dla GPS trackera, który musi parsować NMEA i obsługiwać komunikację. Alternatywy: ATtiny841 (2x UART), ATtiny1614/3216 (nowa seria, więcej pamięci), ATmega328P (jeśli ATtiny nie wystarczy). |
-| **Czy limity pamięci ATtiny2313 są akceptowalne?** | Zdanie NMEA GGA ma ~80 znaków. Przy 128 B RAM i 16 B buforze kołowym parsowanie w locie jest konieczne — brak miejsca na buforowanie pełnych zdań. Czy to akceptowalne ograniczenie? |
-| **Taktowanie i źródło zegara** | Kod zakłada 8 MHz z wewnętrznym oscylatorem (/8 = 1 MHz efektywne). Czy wystarczająca dokładność dla UART GPS (zwykle 9600 bps)? Czy rozważamy zewnętrzny kwarc? |
+| **ATmega328P czy inny?** | ATtiny2313 jest za mały (2 KB Flash, 128 B RAM, 1 UART). Rekomendacja: ATmega328P (32 KB Flash, 2 KB RAM, 1 HW UART + SW UART). Alternatywy: ATtiny841 (2 UART, 8 KB Flash — ciasno), ATtiny1614 (16 KB, UPDI). Czy akceptujesz ATmega328P? |
+| **Gotowy moduł Arduino Nano/Pro Mini czy sam chip?** | Arduino Pro Mini 3.3V (~8 PLN) to ATmega328P na płytce z regulatorem i złączem ISP — oszczędza lutowanie. Sam chip DIP-28 (~8 PLN) + kwarc + kondensatory to bardziej "bare metal" ale wymaga więcej pracy. Co preferujesz? |
+| **Taktowanie** | 8 MHz (wewnętrzny oscylator, wystarczy dla UART 9600) vs 16 MHz (zewnętrzny kwarc, wymagany dla UART 115200 z SIM800L jeśli potrzebny). |
 
 ---
 
@@ -19,103 +25,82 @@ lub w trakcie implementacji trackera GPS na ATtiny.
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Który moduł GPS?** | Popularne opcje: NEO-6M, NEO-7M, NEO-M8N (u-blox), BN-220, L80/L86 (Quectel). Różnią się ceną, poborem prądu, czułością, wsparciem GLONASS/Galileo. |
-| **Protokół komunikacji** | Większość modułów GPS domyślnie wysyła NMEA przez UART (9600 bps). Czy potrzebujemy UBX (binarny protokół u-blox) dla lepszej wydajności? |
-| **Które zdania NMEA parsować?** | `$GPGGA` (pozycja + fix quality), `$GPRMC` (pozycja + prędkość + data), `$GPGLL` (tylko pozycja). Minimalistycznie wystarczy `$GPRMC`. |
-| **Tryb pracy GPS** | Ciągły (stale włączony), periodic (budzi się co N sekund), one-shot (na żądanie)? Ma bezpośredni wpływ na pobór prądu i architekturę. |
+| **Który moduł?** | Wymagania spisane w `WYMAGANIA_GPS.md`. Potrzebna decyzja: NEO-6M (~15 PLN, popularny), BN-220 (~25 PLN, mały, z Flash), BN-880 (~35 PLN, GPS+kompas). |
+| **Które zdania NMEA parsować?** | `$GPRMC` daje: pozycję, czas, datę, prędkość, kurs. Czy to wystarcza? Czy potrzebne `$GPGGA` (liczba satelitów, HDOP, wysokość)? |
 
 ---
 
-## 3. Transmisja danych lokalizacyjnych
+## 3. Serwer i endpoint HTTP
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Jak dane mają opuszczać urządzenie?** | Możliwości: (a) UART do Raspberry Pi (jak teraz), (b) moduł GSM/GPRS (SIM800L) — SMS lub HTTP, (c) LoRa (duży zasięg, mały transfer), (d) Bluetooth/BLE, (e) zapis na kartę SD / EEPROM i odczyt offline. |
-| **Czy Raspberry Pi jest częścią docelowego rozwiązania?** | Obecna architektura testowa używa RPi jako odbiornika UART. Czy w finalnym produkcie RPi jest hubem (np. agregacja + wysyłka do chmury), czy tracker ma być samodzielny? |
-| **Częstotliwość raportowania** | Co ile sekund/minut ma być wysyłana pozycja? To determinuje wymagania energetyczne i przepustowość łącza. |
-| **Format danych wyjściowych** | Surowe NMEA? Przetworzony tekst (lat, lon, time)? Binarny pakiet? JSON? Protokół do ustalenia. |
+| **Jaki endpoint?** | Jaka domena/URL? Format danych: GET z parametrami (`?lat=51.1&lon=17.0&t=123456`) czy POST z body (JSON, form-data)? |
+| **Autentykacja** | Czy endpoint wymaga API key, tokenu, basic auth? Czy wystarczy "security through obscurity" (trudny do zgadnięcia URL)? |
+| **Odpowiedź serwera** | Czy tracker ma czytać odpowiedź HTTP? (np. nowy interwał, komenda "wyłącz się"). Czy fire-and-forget? |
+| **Czy serwer/backend jest w zakresie projektu?** | Czy piszemy też backend (np. prosty serwer Flask/Express z bazą danych i mapą), czy zakładamy istniejący endpoint? |
 
 ---
 
-## 4. Zasilanie i energooszczędność
+## 4. Zasilanie
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Źródło zasilania** | Bateria LiPo? AA/AAA? Zasilanie USB? Solar? Zasilanie samochodowe 12V? |
-| **Wymagany czas pracy na baterii** | Godziny, dni, tygodnie? To determinuje strategię sleep mode i duty cycle GPS. |
-| **Tryby uśpienia** | ATtiny2313 wspiera Power-down (~0.1 µA) i Idle mode. Moduł GPS ma własne tryby sleep. Jaka strategia zarządzania energią? |
-| **Napięcie pracy** | ATtiny2313 działa 2.7–5.5V. Moduły GPS typowo 3.3V. Moduły GSM wymagają 3.4–4.4V z peak current ~2A. Czy potrzebny regulator/konwerter? |
+| **Źródło zasilania** | LiPo 3.7V (idealne dla SIM800L: 3.4–4.4V) vs 3xAA/AAA (4.5V, potrzebny regulator) vs zasilanie USB/samochodowe (5V/12V). |
+| **Wymagany czas pracy** | Godziny? Dni? Tygodnie? Przy LiPo 1000mAh i cyklu co 5 min: ~2-3 dni. Przy co 30 min: ~1-2 tygodnie. |
+| **Czy urządzenie ma działać non-stop czy na żądanie?** | Włącz → śledzi → wyłącz ręcznie? Czy zawsze aktywne z duty cycle? |
 
 ---
 
-## 5. Architektura sprzętu
+## 5. Interwał raportowania
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Ile kanałów UART potrzebujemy?** | ATtiny2313 ma tylko 1 UART sprzętowy. GPS potrzebuje UART. Komunikacja z hostem/modułem GSM też potrzebuje UART. Opcje: software UART (bitbanging), multipleksowanie, wybór MCU z 2 UART. |
-| **Dodatkowe peryferia** | Czy potrzebujemy: I2C (czujniki, OLED), SPI (karta SD, LoRa), ADC (pomiar baterii), PWM (buzzer)? |
-| **Forma fizyczna** | Płytka prototypowa? PCB? Gotowy moduł? Wymiary? Obudowa? |
-| **Antena GPS** | Zintegrowana w module? Zewnętrzna (ceramic patch, helical)? Ma wpływ na form factor i czułość. |
+| **Co ile wysyłać pozycję?** | Co 30s? 1 min? 5 min? 30 min? Bezpośrednio wpływa na żywotność baterii i koszty transmisji danych. |
+| **Stały interwał czy adaptatywny?** | Np. co 30s gdy się porusza, co 5 min gdy stoi? Wymaga detekcji ruchu (porównanie pozycji lub akcelerometr). |
 
 ---
 
-## 6. Środowisko budowania i toolchain
+## 6. Zachowanie przy braku zasięgu
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **System budowania** | CMake został usunięty w ostatnim commicie. Czy wracamy do CMake, używamy PlatformIO, czystego Makefile, czy Arduino framework? |
-| **Programator** | Jaki programator AVR? USBasp, AVRISP mkII, Arduino as ISP, JTAG? To wpływa na workflow flashowania. |
-| **Platforma deweloperska** | Linux (RPi), Windows, macOS? Wszystkie? |
-| **CI/CD** | Czy chcemy automatyczne budowanie i testy w pipeline GitHub? |
+| **Buforowanie offline?** | Czy przy braku zasięgu GSM zapisywać pozycje w EEPROM/RAM i wysłać po powrocie zasięgu? ATmega328P ma 1 KB EEPROM (~50 pozycji). |
+| **Retry policy** | Ile razy ponawiać HTTP request przy błędzie? Timeout? |
 
 ---
 
-## 7. Testowanie
+## 7. Obudowa i montaż
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Testy jednostkowe kodu AVR** | Czy testujemy logikę parsowania NMEA na hoście (x86) przed flashowaniem na AVR? Frameworki: Unity, CMocka, natywna kompilacja z mockami. |
-| **Symulacja** | Czy używamy symulatora AVR (simavr, Proteus) do testów przed hardware? |
-| **Testowanie integracyjne** | Obecne skrypty Python testują UART. Czy rozszerzamy je o automatyczne testy GPS (replay NMEA)? |
-| **Testy hardware-in-the-loop** | Czy budujemy stanowisko testowe z RPi + ATtiny + symulowanym GPS (NMEA replay przez UART)? |
+| **Gdzie będzie montowany tracker?** | Samochód, rower, plecak, zwierzę? Wpływa na: rozmiar, wodoodporność, mocowanie, antena. |
+| **Wodoodporność** | IP rating? Gotowa obudowa? Druk 3D? |
+| **Rozmiar** | Ograniczenia wymiarowe? "Jak najmniejsze" czy "nie ma znaczenia"? |
 
 ---
 
-## 8. Zakres funkcjonalny MVP
+## 8. Programator i narzędzia
 
 | Pytanie | Kontekst |
 |---------|----------|
-| **Co jest MVP (Minimum Viable Product)?** | Propozycja: ATtiny odbiera NMEA z GPS, parsuje pozycję, wysyła przez UART do RPi. Bez GSM, bez sleep, bez baterii. |
-| **Geofencing / alarmy** | Czy tracker ma reagować na wejście/wyjście ze strefy? |
-| **Logowanie trasy** | Czy zapisujemy historię pozycji (EEPROM, zewnętrzna pamięć Flash)? |
-| **Interfejs użytkownika** | LED status? Buzzer? Przycisk? Wyświetlacz? Aplikacja na telefon? Dashboard webowy? |
+| **Jaki programator AVR posiadasz?** | USBasp (~10 PLN), AVRISP mkII, Arduino Uno/Nano jako ISP (bezpłatne jeśli posiadasz). Wpływa na skrypty flashowania. |
+| **Analizator logiczny / oscyloskop?** | Przydatne do debugowania UART. Masz? Jeśli nie — tanie klony Saleae (~30 PLN). |
 
 ---
 
-## 9. Aspekty prawne i regulacyjne
+## Priorytetyzacja
 
-| Pytanie | Kontekst |
-|---------|----------|
-| **Certyfikacja** | Jeśli urządzenie ma być sprzedawane: CE, FCC. Jeśli hobbystycznie — nie dotyczy. |
-| **GPS i prywatność** | Czy śledzenie osób wymaga zgody? Regulacje RODO. |
-| **Częstotliwości radiowe** | Jeśli używamy LoRa/GSM — regulacje pasma ISM, karta SIM. |
-
----
-
-## Priorytetyzacja pytań
-
-**Krytyczne (blokują rozpoczęcie pracy):**
-1. Wybór MCU (ATtiny2313 vs alternatywa)
-2. Moduł GPS
-3. Metoda transmisji danych (UART do RPi vs GSM vs LoRa)
-4. System budowania
+**Krytyczne (blokują implementację):**
+1. Wybór MCU (ATmega328P — do potwierdzenia)
+2. Moduł GPS (do zakupu)
+3. Endpoint HTTP (URL, format, auth)
 
 **Ważne (wpływają na architekturę):**
-5. Zasilanie
-6. Liczba kanałów UART / software UART
-7. Zakres MVP
+4. Źródło zasilania
+5. Interwał raportowania
+6. Programator AVR
 
 **Mogą poczekać:**
-8. Form factor / PCB
-9. CI/CD
-10. Certyfikacja
+7. Buforowanie offline
+8. Obudowa / form factor
+9. Backend / dashboard
