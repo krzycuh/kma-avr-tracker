@@ -1,9 +1,9 @@
 # kma-avr-tracker
 
-GPS tracker na **ATtiny2313 + SIM800L**: po zadzwonieniu na numer karty SIM tracker
-odrzuca połączenie, pobiera przez GPRS pozycję najbliższej stacji bazowej GSM i odsyła
-SMS z linkiem do Google Maps. Bazuje na projekcie
-[mcore1976/gpstracker](https://github.com/mcore1976/gpstracker) (`main3b.c`).
+GPS tracker na **ATtiny2313 + SIM800L**: cyklicznie pobiera przez GPRS pozycję najbliższej
+stacji bazowej GSM (`AT+CIPGSMLOC`) i wysyła ją **HTTP GET-em na serwer REST**
+(`?token=...&lat=...&lon=...`). Bez dzwonienia i SMS-ów. Inspirowany projektem
+[mcore1976/gpstracker](https://github.com/mcore1976/gpstracker).
 
 - **Plan projektu i kamienie milowe:** [docs/PLAN.md](docs/PLAN.md)
 - **Projekt układu (połączenia, zasilanie, BOM):** [docs/SCHEMAT.md](docs/SCHEMAT.md)
@@ -13,11 +13,12 @@ SMS z linkiem do Google Maps. Bazuje na projekcie
 ## Programy AVR (`avr-app/`)
 
 ### gps-tracker.c — docelowy firmware trackera
-- Port `main3b.c` z projektu referencyjnego, dostosowany do stylu repo; 1786 B flasha (87%).
-- Konfiguracja SIM800L (9600 bps, PIN, rejestracja 2G), sen modułu, czekanie na RI (PD2),
-  po połączeniu: GPRS → `AT+CIPGSMLOC` → SMS z linkiem do mapy na numer dzwoniącego.
-- Przed wgraniem uzupełnij sekcję **KONFIGURACJA** (PIN karty, APN operatora).
-- Uwaga: PD2 to wejście RI — odłącz diodę LED używaną w programach testowych.
+- Co `REPORT_INTERVAL_MIN` minut: GPRS attach → `AT+CIPGSMLOC` → HTTP GET na serwer
+  (wbudowany klient HTTP SIM800L) → sen modułu (`AT+CSCLK=2`); 1762 B flasha (86%).
+- Odporność: timeout ~5 s na znak UART, 3 próby GPRS, rekonfiguracja po restarcie modułu,
+  tryb samolotowy przy braku zasięgu 2G. Dioda PD3 miga 3× po potwierdzonym raporcie (HTTP 200).
+- Przed wgraniem uzupełnij sekcję **KONFIGURACJA** (PIN karty, APN, `API_URL`, `API_TOKEN`,
+  interwał). Uwaga: URL musi być `http://` — SIM800L nie obsługuje współczesnego TLS.
 
 ### sim800l-test.c — test komend AT
 - Krok pośredni: cyklicznie wysyła `AT`, po odebraniu i rozpoznaniu `OK` miga diodą PD3.
@@ -37,12 +38,21 @@ SMS z linkiem do Google Maps. Bazuje na projekcie
 ## Narzędzia na RPi (`uart-test/`)
 
 ### sim800l-simulator.py — symulator SIM800L
-- Udaje moduł SIM800L na porcie szeregowym RPi: odpowiada na komendy AT, obsługuje tryb
-  SMS (znak zachęty `>` + Ctrl+Z), zwraca sztuczną pozycję z `AT+CIPGSMLOC`.
-- Komenda `ring` symuluje przychodzące połączenie (`RING` + `+CLIP`), z `--ri-pin N`
-  steruje też linią RI podłączoną do PD2.
-- Pozwala przetestować cały `gps-tracker.c` bez fizycznego modułu — scenariusze w
-  [docs/PLAN.md](docs/PLAN.md) (M1–M2).
+- Udaje moduł SIM800L na porcie szeregowym RPi: odpowiada na komendy AT (CPIN, CREG,
+  SAPBR, CIPGSMLOC) i emuluje klienta HTTP (`+HTTPACTION: 0,200`).
+- Gdy firmware ustawia URL raportu, wypisuje go wraz z rozbitym tokenem i współrzędnymi —
+  pozwala przetestować cały `gps-tracker.c` bez fizycznego modułu.
+- Komendy interaktywne: `noreg`/`reg` (symulacja braku zasięgu), `httpfail` (błąd HTTP 601).
+- Scenariusze testów w [docs/PLAN.md](docs/PLAN.md) (M1–M2).
 
 ### uart-request-test.py / uart-receiver-test.py — testy UART
 - Proste skrypty do testów echa i odbioru danych z AVR.
+
+## Serwer (`server-test/`)
+
+### location-server.py — przykładowy endpoint REST
+- Czysty Python (stdlib): `GET /api/location?token=...&lat=...&lon=...` → walidacja tokenu
+  (403 przy złym), dopisanie pozycji z timestampem do CSV, link do Google Maps w logu.
+- Uruchomienie: `python3 server-test/location-server.py --port 8080 --token twoj-token`.
+- Musi być osiągalny z publicznego internetu (tracker łączy się z sieci operatora) —
+  opcje hostingu w [docs/PLAN.md](docs/PLAN.md), kamień M3.
