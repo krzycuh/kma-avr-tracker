@@ -1,34 +1,36 @@
 /* ---------------------------------------------------------------------------------------------
- * GPS tracker na ATTINY2313 + SIM800L - wersja z raportowaniem HTTP (REST)
- * Inspirowany projektem https://github.com/mcore1976/gpstracker (main3b.c),
- * ale zamiast dzwonienia i SMS: cykliczny raport pozycji na serwer web.
+ * GPS tracker na ATmega328P + SIM7000E (Waveshare NB-IoT/LTE/GPRS/GNSS HAT)
+ * Wersja z raportowaniem HTTP (REST) i prawdziwym GPS.
  *
  * Zasada działania:
- *  1. Po starcie konfiguruje SIM800L (stała prędkość 9600, echo off, PIN, rejestracja 2G, APN).
+ *  1. Po starcie budzi moduł (impuls na PWRKEY jeśli milczy), konfiguruje go
+ *     (stała prędkość 9600, echo off, PIN, tryb sieci LTE-M/NB-IoT/GSM auto),
+ *     włącza odbiornik GNSS i czeka na zalogowanie do sieci (AT+CGATT?).
  *  2. Co REPORT_INTERVAL_MIN minut:
- *     - budzi SIM800L i otwiera kontekst GPRS (AT+SAPBR),
- *     - pyta o pozycję najbliższej stacji bazowej BTS (AT+CIPGSMLOC),
- *     - wysyła HTTP GET na serwer:  API_URL?token=API_TOKEN&lat=<szer>&lon=<dług>
+ *     - pyta GNSS o pozycję (AT+CGNSINF) aż będzie fix (do ~3 min),
+ *     - aktywuje połączenie danych (AT+CNACT) i wysyła HTTP GET na serwer:
+ *       API_SERVER API_PATH?token=API_TOKEN&lat=<szer>&lon=<dług>
  *     - po odpowiedzi HTTP 200 miga diodą na PD3,
- *     - zamyka GPRS, usypia SIM800L (AT+CSCLK=2) i czeka do następnego raportu.
- *  3. Przy braku zasięgu 2G: tryb samolotowy na 30 min (oszczędzanie baterii w garażu).
+ *     - dezaktywuje połączenie danych i czeka do następnego raportu.
+ *  3. Przy braku sieci: tryb samolotowy na 30 min (oszczędzanie baterii w garażu).
  *
- * Dokładność pozycji = pozycja stacji bazowej GSM (SIM800L nie ma GPS).
+ * Pozycja pochodzi z prawdziwego odbiornika GNSS modułu (GPS/GLONASS/Galileo/BeiDou).
+ * W tej wersji GNSS jest włączony na stałe (szybkie fixy); optymalizacja poboru
+ * prądu (CGNSPWR=0 między raportami, tryb PSM) - patrz kamień M6 w docs/PLAN.md.
  *
- * UWAGA bezpieczeństwo: SIM800L nie obsługuje współczesnego TLS - raport idzie czystym
- * HTTP, więc token jest widoczny dla operatora/sieci. Używaj dedykowanego tokenu
- * (nie hasła!) i waliduj go po stronie serwera.
+ * UWAGA bezpieczeństwo: raport idzie czystym HTTP - token jest widoczny w sieci.
+ * Używaj dedykowanego losowego tokenu (nie hasła!). SIM7000E umie TLS 1.2 (HTTPS),
+ * ale to świadomie odłożone na później - patrz docs/PLAN.md.
  *
  * Wymagania sprzętowe (szczegóły w docs/SCHEMAT.md):
- *  - zegar 1 MHz (wewnętrzny RC 8 MHz z dzielnikiem /8 - fabryczne fuse bity ATtiny2313)
- *  - UART: PD0(RXD) <- SIM800L TXD, PD1(TXD) -> SIM800L RXD
+ *  - ATmega328P na wewnętrznym RC 8 MHz z dzielnikiem /8 = 1 MHz (fabryczne fuse bity)
+ *  - UART: PD0(RXD) <- HAT TXD, PD1(TXD) -> HAT RXD (logika 3,3V - zasilaj AVR z 3,3V!)
+ *  - PD4 -> pin PWR HAT-a (przełączanie zasilania modułu impulsem)
  *  - PD3: opcjonalna dioda LED statusu (miga po udanym raporcie)
- *  - SIM800L musi mieć ustawione na stałe 9600 bps: AT+IPR=9600 + AT&W
- *    (program też to ustawia przy każdym starcie)
  * --------------------------------------------------------------------------------------------- */
 
 #ifndef F_CPU
-#define F_CPU 1000000UL   // 8MHz z dzielnikiem /8 = 1MHz (fabryczne fuses ATtiny2313)
+#define F_CPU 1000000UL   // 8MHz z dzielnikiem /8 = 1MHz (fabryczne fuses ATmega328P)
 #endif
 
 #include <avr/io.h>
@@ -40,117 +42,121 @@
 // KONFIGURACJA - dostosuj do swojej karty SIM, operatora i serwera
 // *********************************************************************************************
 #define SIM_PIN   "1111"       // kod PIN karty SIM (używany tylko gdy karta go wymaga)
-#define GPRS_APN  "internet"   // APN operatora (np. "internet" dla Orange/Play/Plus/T-Mobile PL)
-#define GPRS_USER "internet"   // użytkownik APN (w PL zwykle pusty lub "internet")
-#define GPRS_PASS "internet"   // hasło APN
+#define APN       "internet"   // APN operatora (np. "internet" dla Orange PL)
 
-// Adres endpointu REST - MUSI być http:// (SIM800L nie obsługuje nowoczesnego TLS!)
-// Do URL doklejane jest: ?token=<API_TOKEN>&lat=<szerokość>&lon=<długość>
-#define API_URL   "http://example.com:8080/api/location"
-#define API_TOKEN "twoj-tajny-token"
+// Serwer REST - MUSI być http:// (HTTPS to osobny etap - patrz docs/PLAN.md)
+#define API_SERVER "http://example.com:8080"   // bazowy adres: protokół + host + port
+#define API_PATH   "/api/location"             // ścieżka endpointu
+#define API_TOKEN  "twoj-tajny-token"
 
-// Co ile minut wysyłać raport pozycji (im rzadziej, tym dłużej działa bateria)
+// Co ile minut wysyłać raport pozycji
 #define REPORT_INTERVAL_MIN 10
 
-// Parametry komunikacji UART - jak w attiny-rpi-2way-com.c
+// Ile sekund czekać na fix GNSS w jednym cyklu (odpytywanie co 5 s)
+#define GNSS_FIX_TIMEOUT_SEC 180
+
+// Parametry komunikacji UART
 #define BAUD 9600
-// FCPU = 1MHz, bit U2X daje błąd tylko 0.2% przy 9600 bps
+// FCPU = 1MHz, bit U2X0 daje błąd tylko 0.2% przy 9600 bps
 #define MYUBBR ((F_CPU / (BAUD * 8L)) - 1)
 
-// Rozmiar bufora na pojedynczą linię odpowiedzi z SIM800L
-#define BUFFER_SIZE 40
+// Rozmiar bufora na pojedynczą linię odpowiedzi (linia +CGNSINF ma ~95 znaków)
+#define BUFFER_SIZE 120
 
 // Limit czekania na pojedynczy znak z UART: ~5 s przy 1 MHz
-// (pętla odpytująca RXC; dzięki temu program nie zawiesza się gdy modem milczy)
 #define RX_TIMEOUT_LOOPS 500000UL
 
 // *********************************************************************************************
-// Komendy AT i wzorce odpowiedzi - trzymane w pamięci FLASH (PROGMEM), bo RAM to tylko 128B
+// Komendy AT i wzorce odpowiedzi (słownik SIM7000E) - w pamięci FLASH (PROGMEM)
 // *********************************************************************************************
-const char AT[] PROGMEM              = "AT\r\n";
-const char ISOK[] PROGMEM            = "OK";
-const char ISREG1[] PROGMEM          = "+CREG: 0,1";      // zarejestrowany w sieci macierzystej
-const char ISREG2[] PROGMEM          = "+CREG: 0,5";      // zarejestrowany w roamingu
-const char SHOW_REGISTRATION[] PROGMEM = "AT+CREG?\r\n";
-const char DISREGURC[] PROGMEM       = "AT+CREG=0\r\n";   // wyłącz raportowanie utraty zasięgu
-const char PIN_IS_READY[] PROGMEM    = "+CPIN: READY";
+const char AT[] PROGMEM       = "AT\r\n";
+const char ISOK[] PROGMEM     = "OK";
+const char ECHO_OFF[] PROGMEM = "ATE0\r\n";
+
+// Utrwalenie prędkości 9600 bps (moduł po starcie robi autodetekcję)
+const char SET9600[] PROGMEM  = "AT+IPR=9600\r\n";
+const char SAVECNF[] PROGMEM  = "AT&W\r\n";
+
+// Karta SIM
+const char SHOW_PIN[] PROGMEM            = "AT+CPIN?\r\n";
+const char PIN_IS_READY[] PROGMEM        = "+CPIN: READY";
 const char PIN_MUST_BE_ENTERED[] PROGMEM = "+CPIN: SIM PIN";
-const char SHOW_PIN[] PROGMEM        = "AT+CPIN?\r\n";
-const char ECHO_OFF[] PROGMEM        = "ATE0\r\n";
-const char ENTER_PIN[] PROGMEM       = "AT+CPIN=\"" SIM_PIN "\"\r\n";
+const char ENTER_PIN[] PROGMEM           = "AT+CPIN=\"" SIM_PIN "\"\r\n";
 
-// Tryb samolotowy - oszczędzanie baterii gdy brak zasięgu (np. podziemny garaż)
-const char FLIGHT_ON[] PROGMEM       = "AT+CFUN=4\r\n";
-const char FLIGHT_OFF[] PROGMEM      = "AT+CFUN=1\r\n";
+// Wybór technologii radiowej: auto GSM/LTE + Cat-M i NB-IoT
+const char SET_NETMODE[] PROGMEM = "AT+CNMP=2\r\n";   // 2 = automatycznie (LTE i GSM)
+const char SET_IOTMODE[] PROGMEM = "AT+CMNB=3\r\n";   // 3 = Cat-M i NB-IoT
 
-// Tryb uśpienia SIM800L (CSCLK=2: moduł śpi, budzi go aktywność na UART)
-const char SLEEP_ON[] PROGMEM        = "AT+CSCLK=2\r\n";
-const char SLEEP_OFF[] PROGMEM       = "AT+CSCLK=0\r\n";
+// Rejestracja/attach do sieci pakietowej (działa i dla LTE-M, i dla 2G)
+const char SHOW_ATTACH[] PROGMEM = "AT+CGATT?\r\n";
+const char ISATTACHED[] PROGMEM  = "+CGATT: 1";
 
-// Utrwalenie prędkości 9600 bps w konfiguracji SIM800L
-const char SET9600[] PROGMEM         = "AT+IPR=9600\r\n";
-const char SAVECNF[] PROGMEM         = "AT&W\r\n";
+// Tryb samolotowy - oszczędzanie baterii gdy brak zasięgu
+const char FLIGHT_ON[] PROGMEM  = "AT+CFUN=4\r\n";
+const char FLIGHT_OFF[] PROGMEM = "AT+CFUN=1\r\n";
 
-// Konfiguracja GPRS (kontekst IP potrzebny do CIPGSMLOC i HTTP)
-const char SAPBR1[] PROGMEM = "AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"\r\n";
-const char SAPBR2[] PROGMEM = "AT+SAPBR=3,1,\"APN\",\"" GPRS_APN "\"\r\n";
-const char SAPBR3[] PROGMEM = "AT+SAPBR=3,1,\"USER\",\"" GPRS_USER "\"\r\n";
-const char SAPBR4[] PROGMEM = "AT+SAPBR=3,1,\"PWD\",\"" GPRS_PASS "\"\r\n";
-const char SAPBROPEN[] PROGMEM  = "AT+SAPBR=1,1\r\n";   // otwórz kontekst IP
-const char SAPBRQUERY[] PROGMEM = "AT+SAPBR=2,1\r\n";   // sprawdź kontekst IP
-const char SAPBRCLOSE[] PROGMEM = "AT+SAPBR=0,1\r\n";   // zamknij kontekst IP
-const char SAPBRSUCC[] PROGMEM  = "+SAPBR: 1,1";        // odpowiedź gdy kontekst otwarty
-const char CHECKGPS[] PROGMEM   = "AT+CIPGSMLOC=1,1\r\n"; // pozycja najbliższego BTS
+// GNSS (prawdziwy GPS wbudowany w SIM7000E)
+const char GNSS_ON[] PROGMEM   = "AT+CGNSPWR=1\r\n";
+const char GNSS_INFO[] PROGMEM = "AT+CGNSINF\r\n";
+const char ISGNSINF[] PROGMEM  = "+CGNSINF:";
 
-// Wbudowany klient HTTP modułu SIM800L
-const char HTTPINIT[] PROGMEM     = "AT+HTTPINIT\r\n";
-const char HTTPPARA_CID[] PROGMEM = "AT+HTTPPARA=\"CID\",1\r\n";
-// początek komendy z URL - dalej doklejane są współrzędne z buforów
-const char HTTPURL[] PROGMEM      = "AT+HTTPPARA=\"URL\",\"" API_URL "?token=" API_TOKEN "&lat=";
-const char URL_LON[] PROGMEM      = "&lon=";
-const char URL_END[] PROGMEM      = "\"\r\n";
-const char HTTPACTION[] PROGMEM   = "AT+HTTPACTION=0\r\n";  // 0 = metoda GET
-const char HTTPTERM[] PROGMEM     = "AT+HTTPTERM\r\n";
-const char ISHTTPOK[] PROGMEM     = "+HTTPACTION: 0,200";   // serwer przyjął raport
+// Połączenie danych warstwy aplikacyjnej (zastępuje SAPBR z SIM800L)
+const char NET_ON[] PROGMEM    = "AT+CNACT=1,\"" APN "\"\r\n";
+const char NET_OFF[] PROGMEM   = "AT+CNACT=0\r\n";
+const char ISPDPACT[] PROGMEM  = "+APP PDP: ACTIVE";
+
+// Klient HTTP SIM7000E (aplikacja "SH")
+const char SHCONF_URL[] PROGMEM  = "AT+SHCONF=\"URL\",\"" API_SERVER "\"\r\n";
+const char SHCONF_BL[] PROGMEM   = "AT+SHCONF=\"BODYLEN\",1024\r\n";
+const char SHCONF_HL[] PROGMEM   = "AT+SHCONF=\"HEADERLEN\",350\r\n";
+const char SHCONN[] PROGMEM      = "AT+SHCONN\r\n";
+const char SHSTATE[] PROGMEM     = "AT+SHSTATE?\r\n";
+const char ISCONNECTED[] PROGMEM = "+SHSTATE: 1";
+// początek komendy GET - dalej doklejane są współrzędne z buforów
+const char SHREQ_START[] PROGMEM = "AT+SHREQ=\"" API_PATH "?token=" API_TOKEN "&lat=";
+const char SHREQ_LON[] PROGMEM   = "&lon=";
+const char SHREQ_END[] PROGMEM   = "\",1\r\n";        // 1 = metoda GET
+const char ISHTTP200[] PROGMEM   = "+SHREQ: \"GET\",200";
+const char SHDISC[] PROGMEM      = "AT+SHDISC\r\n";
 
 // *********************************************************************************************
-// Bufory robocze (RAM ATtiny2313 to tylko 128 bajtów - stąd oszczędne rozmiary)
+// Bufory robocze
 // *********************************************************************************************
-static char response[BUFFER_SIZE];   // ostatnia linia odpowiedzi z SIM800L
+static char response[BUFFER_SIZE];   // ostatnia linia odpowiedzi z modułu
 static uint8_t responsePos = 0;
-static char latitude[10];            // szerokość geograficzna z CIPGSMLOC
-static char longtitude[10];          // długość geograficzna z CIPGSMLOC
-static char buf[20];                 // bufor na wzorce kopiowane z PROGMEM do porównań
+static char latitude[12];            // szerokość geograficzna z CGNSINF
+static char longtitude[12];          // długość geograficzna z CGNSINF
+static char buf[24];                 // bufor na wzorce kopiowane z PROGMEM do porównań
 static uint8_t rxOk;                 // 0 = ostatni odbiór znaku zakończył się timeoutem
 
 // *********************************************************************************************
-// UART - transmisja odpytywana (polling, bez przerwań)
+// UART0 - transmisja odpytywana (polling, bez przerwań)
 // Odbiór blokujący z timeoutem ~5s: program czeka na odpowiedzi modemu, ale się nie zawiesi
 // *********************************************************************************************
 void initUart(void) {
-  UCSRA = (1 << U2X);                    // podwójna prędkość - mniejszy błąd baud rate
-  UBRRH = (uint8_t)(MYUBBR >> 8);
-  UBRRL = (uint8_t)(MYUBBR);
-  UCSRB = (1 << RXEN) | (1 << TXEN);     // RX i TX włączone, BEZ przerwań
-  UCSRC = (0 << USBS) | (3 << UCSZ0);    // ramka 8N1
+  UCSR0A = (1 << U2X0);                    // podwójna prędkość - mniejszy błąd baud rate
+  UBRR0H = (uint8_t)(MYUBBR >> 8);
+  UBRR0L = (uint8_t)(MYUBBR);
+  UCSR0B = (1 << RXEN0) | (1 << TXEN0);    // RX i TX włączone, BEZ przerwań
+  UCSR0C = (0 << USBS0) | (3 << UCSZ00);   // ramka 8N1
 }
 
 // Wysłanie pojedynczego znaku (czeka aż rejestr nadawczy będzie wolny)
 void sendCharUart(uint8_t charToSend) {
-  while (!(UCSRA & (1 << UDRE)));
-  UDR = charToSend;
+  while (!(UCSR0A & (1 << UDRE0)));
+  UDR0 = charToSend;
 }
 
 // Odbiór pojedynczego znaku; przy braku danych przez ~5s ustawia rxOk=0 i zwraca 0
 uint8_t receiveCharUart(void) {
   uint32_t i = 0;
-  while (!(UCSRA & (1 << RXC))) {
+  while (!(UCSR0A & (1 << RXC0))) {
     if (++i > RX_TIMEOUT_LOOPS) {
       rxOk = 0;
       return 0;
     }
   }
-  return UDR;
+  return UDR0;
 }
 
 // Wysłanie łańcucha znaków z RAM
@@ -174,7 +180,7 @@ void sendStringPgm(const char *stringToSend) {
 // *********************************************************************************************
 void delaySec(uint8_t seconds) {
   while (seconds > 0) {
-    // 1 000 000 cykli = 1s przy 1MHz (wygenerowane przez kalkulator pętli opóźniających)
+    // 1 000 000 cykli = 1s przy 1MHz
     asm volatile (
       "    ldi  r18, 6"   "\n"
       "    ldi  r19, 19"  "\n"
@@ -199,8 +205,8 @@ uint8_t isInBuffer(char *str, char *sub) {
   for (i = 0; i < BUFFER_SIZE; i++) {
     if (str[i] == sub[j]) {
       for (k = i, j = 0; str[k] && sub[j]; j++, k++)
-        if (str[k] != sub[j]) break;     // różnica - porównuj od następnego znaku
-      if (j == strlen(sub)) return 1;    // znaleziono cały podciąg
+        if (str[k] != sub[j]) break;
+      if (j == strlen(sub)) return 1;
     }
   }
   return 0;
@@ -224,13 +230,11 @@ uint8_t readLine(void) {
     char1 = receiveCharUart();
     if (!rxOk) return 0;
     if (char1 != 0x0a && char1 != 0x0d) {
-      // zwykły znak - dopisz do bufora (z ochroną przed przepełnieniem)
       if (responsePos < BUFFER_SIZE - 1) {
         response[responsePos] = char1;
         responsePos++;
       }
     } else if (responsePos > 0) {
-      // CR lub LF po jakichś znakach = koniec linii (puste CR/LF pomijamy)
       response[responsePos] = '\0';
       return 1;
     }
@@ -255,50 +259,41 @@ uint8_t waitFor_P(const char *pattern, uint8_t patternSize, uint8_t maxTimeouts)
 }
 
 // *********************************************************************************************
-// Parsowanie odpowiedzi AT+CIPGSMLOC: +CIPGSMLOC: 0,<długość>,<szerokość>,<data>,<czas>
-// Współrzędne trafiają do 'longtitude' i 'latitude'. Zwraca 0 przy błędzie/timeoucie
-// (np. odpowiedź "+CIPGSMLOC: 601" bez współrzędnych).
+// Parsowanie linii +CGNSINF: <run>,<fix>,<utc>,<szerokość>,<długość>,<wysokość>,...
+// (uwaga: kolejność szerokość-długość, odwrotnie niż w CIPGSMLOC z SIM800L)
+// Zwraca 1 i wypełnia bufory latitude/longtitude tylko gdy jest fix.
 // *********************************************************************************************
-uint8_t readCellGps(void) {
-  uint8_t char1;
+uint8_t parseGnsInf(void) {
+  char *p = strchr(response, ':');
+  uint8_t field = 0;    // 0=run, 1=fix, 2=utc, 3=szerokość, 4=długość
   uint8_t pos = 0;
-  rxOk = 1;
+  uint8_t fix = 0;
 
-  // czekaj na pierwszy przecinek (po kodzie statusu "0")
-  do {
-    char1 = receiveCharUart();
-    if (!rxOk) return 0;
-  } while (char1 != ',');
+  if (p == 0) return 0;
+  p++;
+  while (*p == ' ') p++;
 
-  // kopiuj DŁUGOŚĆ geograficzną do przecinka
-  do {
-    char1 = receiveCharUart();
-    if (!rxOk) return 0;
-    if (pos < sizeof(longtitude) - 1) longtitude[pos++] = char1;
-  } while (char1 != ',');
-  longtitude[pos - 1] = '\0';
-  pos = 0;
+  latitude[0] = '\0';
+  longtitude[0] = '\0';
 
-  // kopiuj SZEROKOŚĆ geograficzną do przecinka
-  do {
-    char1 = receiveCharUart();
-    if (!rxOk) return 0;
-    if (pos < sizeof(latitude) - 1) latitude[pos++] = char1;
-  } while (char1 != ',');
-  latitude[pos - 1] = '\0';
+  for (; *p; p++) {
+    if (*p == ',') {
+      if (field == 3) latitude[pos] = '\0';
+      if (field == 4) { longtitude[pos] = '\0'; break; }   // mamy wszystko
+      field++;
+      pos = 0;
+      continue;
+    }
+    if (field == 1 && *p == '1') fix = 1;
+    if (field == 3 && pos < sizeof(latitude) - 1)   latitude[pos++] = *p;
+    if (field == 4 && pos < sizeof(longtitude) - 1) longtitude[pos++] = *p;
+  }
 
-  // resztę linii (data/czas) pomijamy - znacznik czasu nadaje serwer przy odbiorze;
-  // doczytujemy tylko do końca linii, żeby opróżnić bufor odbiorczy
-  do {
-    char1 = receiveCharUart();
-    if (!rxOk) return 0;
-  } while (char1 != 0x0a && char1 != 0x0d);
-
-  return 1;
+  return (fix && latitude[0] != '\0' && longtitude[0] != '\0');
 }
 
 // *********************************************************************************************
-// Dioda statusu na PD3 - 3 szybkie mignięcia po udanym raporcie (pomocne przy debugowaniu)
+// Dioda statusu na PD3 - 3 szybkie mignięcia po udanym raporcie
 // *********************************************************************************************
 void blinkStatus(void) {
   uint8_t i;
@@ -311,15 +306,32 @@ void blinkStatus(void) {
 }
 
 // *********************************************************************************************
-// Inicjalizacja SIM800L
+// Zarządzanie zasilaniem modułu przez pin PWR HAT-a (PD4)
+// Impuls WYSOKI ~2s przełącza zasilanie modułu (włącza wyłączony / wyłącza włączony)
+// *********************************************************************************************
+void togglePower(void) {
+  PORTD |= (1 << PD4);
+  delaySec(2);
+  PORTD &= ~(1 << PD4);
+  delaySec(15);   // czas na start modułu
+}
+
+// *********************************************************************************************
+// Inicjalizacja modułu SIM7000E
 // *********************************************************************************************
 
-// Czekaj aż moduł odpowie OK na AT (SIM800L po starcie robi autodetekcję prędkości,
-// więc AT trzeba powtarzać aż moduł złapie 9600 bps)
+// Czekaj aż moduł odpowie OK na AT; jeśli długo milczy - spróbuj włączyć go pinem PWR
 uint8_t checkAt(void) {
-  do {
+  uint8_t silent = 0;
+  while (1) {
     sendStringPgm(AT);
-  } while (waitFor_P(ISOK, sizeof(ISOK), 1) == 0);
+    if (waitFor_P(ISOK, sizeof(ISOK), 1)) break;
+    silent++;
+    if (silent >= 4) {       // ~20s ciszy: moduł pewnie wyłączony - impuls PWRKEY
+      togglePower();
+      silent = 0;
+    }
+  }
   delaySec(1);
   sendStringPgm(ECHO_OFF);   // wyłącz echo komend - upraszcza parsowanie odpowiedzi
   delaySec(1);
@@ -341,50 +353,89 @@ uint8_t checkPin(void) {
   }
 }
 
-// Czekaj na rejestrację w sieci 2G; po ~5 minutach bez sieci: tryb samolotowy
-// i sen na 30 minut (nie drenuj baterii np. w podziemnym garażu)
-uint8_t checkRegistration(void) {
+// Czekaj na attach do sieci pakietowej (LTE-M/NB-IoT/2G); po ~5 minutach bez sieci:
+// tryb samolotowy i sen na 30 minut (nie drenuj baterii np. w podziemnym garażu)
+uint8_t checkAttach(void) {
   uint8_t attempts = 0, m;
   while (1) {
-    sendStringPgm(SHOW_REGISTRATION);
+    sendStringPgm(SHOW_ATTACH);
     if (readLine()) {
-      if (responseContains_P(ISREG1, sizeof(ISREG1))) return 1;
-      if (responseContains_P(ISREG2, sizeof(ISREG2))) return 1;
+      if (responseContains_P(ISATTACHED, sizeof(ISATTACHED))) return 1;
     }
     delaySec(15);
     attempts++;
     if (attempts >= 20) {
-      // ~5 minut bez sieci: wyłącz radio i uśpij moduł na 30 minut
       sendStringPgm(FLIGHT_ON);
-      delaySec(1);
-      sendStringPgm(SLEEP_ON);
       for (m = 0; m < 30; m++) {
         delaySec(60);
       }
-      // obudź moduł, włącz radio i szukaj sieci od nowa
-      sendStringPgm(AT);
-      delaySec(1);
-      sendStringPgm(SLEEP_OFF);
-      delaySec(1);
       sendStringPgm(FLIGHT_OFF);
-      delaySec(5);
+      delaySec(10);
       attempts = 0;
     }
   }
 }
 
-// Skonfiguruj parametry GPRS/APN (bez sprawdzania błędów - unikamy zakleszczeń)
-uint8_t provisionGprs(void) {
+// *********************************************************************************************
+// Pobranie pozycji z GNSS: odpytuj AT+CGNSINF co 5s aż będzie fix (max GNSS_FIX_TIMEOUT_SEC)
+// *********************************************************************************************
+uint8_t getGnssFix(void) {
+  uint8_t tries = GNSS_FIX_TIMEOUT_SEC / 5;
+  while (tries > 0) {
+    sendStringPgm(GNSS_INFO);
+    if (waitFor_P(ISGNSINF, sizeof(ISGNSINF), 1)) {
+      if (parseGnsInf()) return 1;   // jest fix - współrzędne w buforach
+    }
+    delaySec(5);
+    tries--;
+  }
+  return 0;   // brak fixu w tym cyklu (np. auto w garażu podziemnym)
+}
+
+// *********************************************************************************************
+// Wysłanie raportu HTTP GET przez klienta "SH" modułu. Zwraca 1 gdy serwer odpowiedział 200.
+// *********************************************************************************************
+uint8_t sendReport(void) {
+  uint8_t ok = 0;
+
+  // aktywuj połączenie danych i czekaj na potwierdzenie PDP
+  sendStringPgm(NET_ON);
+  if (waitFor_P(ISPDPACT, sizeof(ISPDPACT), 4) == 0) {
+    sendStringPgm(NET_OFF);
+    delaySec(2);
+    return 0;
+  }
+  delaySec(1);
+
+  // konfiguracja klienta HTTP i połączenie z serwerem
+  sendStringPgm(SHCONF_URL);
+  delaySec(1);
+  sendStringPgm(SHCONF_BL);
+  delaySec(1);
+  sendStringPgm(SHCONF_HL);
+  delaySec(1);
+  sendStringPgm(SHCONN);       // nawiązanie połączenia TCP - może potrwać kilka sekund
+  delaySec(5);
+  sendStringPgm(SHSTATE);
+  if (waitFor_P(ISCONNECTED, sizeof(ISCONNECTED), 2)) {
+    // GET /api/location?token=...&lat=<szer>&lon=<dług>
+    sendStringPgm(SHREQ_START);
+    sendStringUart(latitude);
+    sendStringPgm(SHREQ_LON);
+    sendStringUart(longtitude);
+    sendStringPgm(SHREQ_END);
+    // czekaj na URC +SHREQ: "GET",200,<długość> - do ~40s
+    if (waitFor_P(ISHTTP200, sizeof(ISHTTP200), 8)) {
+      ok = 1;
+    }
+    sendStringPgm(SHDISC);     // rozłącz klienta HTTP
+    delaySec(1);
+  }
+
+  // dezaktywuj połączenie danych
+  sendStringPgm(NET_OFF);
   delaySec(2);
-  sendStringPgm(SAPBR1);
-  delaySec(1);
-  sendStringPgm(SAPBR2);
-  delaySec(1);
-  sendStringPgm(SAPBR3);
-  delaySec(1);
-  sendStringPgm(SAPBR4);
-  delaySec(1);
-  return 1;
+  return ok;
 }
 
 // *********************************************************************************************
@@ -394,92 +445,52 @@ uint8_t provisionGprs(void) {
 // *********************************************************************************************
 int main(void) {
 
-  uint8_t initialized, attempt, m;
+  uint8_t m;
 
   initUart();
 
-  // PD3 jako wyjście - opcjonalna dioda statusu
-  DDRD |= (1 << PD3);
-  PORTD &= ~(1 << PD3);
+  // PD3: dioda statusu, PD4: sterowanie pinem PWR HAT-a (spoczynkowo stan niski)
+  DDRD |= (1 << PD3) | (1 << PD4);
+  PORTD &= ~((1 << PD3) | (1 << PD4));
 
-  // 10 sekund na bezpieczny start SIM800L
-  delaySec(10);
+  // czas na start HAT-a po podaniu zasilania
+  delaySec(5);
 
-  // nawiąż komunikację AT i utrwal konfigurację 9600 bps
+  // nawiąż komunikację AT (w razie potrzeby włączy moduł pinem PWR)
   checkAt();
-  sendStringPgm(SET9600);
-  delaySec(2);
-  sendStringPgm(DISREGURC);
-  delaySec(2);
-  sendStringPgm(SAVECNF);
-  delaySec(3);
 
-  // PIN karty SIM, rejestracja w sieci i parametry APN
+  // utrwal prędkość 9600 bps
+  sendStringPgm(SET9600);
+  delaySec(1);
+  sendStringPgm(SAVECNF);
+  delaySec(2);
+
+  // PIN karty, tryb sieci (auto LTE-M/NB-IoT/GSM), GNSS włączony na stałe
   checkPin();
-  checkRegistration();
-  provisionGprs();
+  sendStringPgm(SET_NETMODE);
+  delaySec(2);
+  sendStringPgm(SET_IOTMODE);
+  delaySec(2);
+  sendStringPgm(GNSS_ON);
+  delaySec(2);
+
+  // czekaj na zalogowanie do sieci pakietowej
+  checkAttach();
 
   // pętla główna: raport pozycji co REPORT_INTERVAL_MIN minut
   while (1) {
 
-    // otwórz kontekst GPRS - do 3 prób
-    initialized = 0;
-    attempt = 0;
-    do {
-      sendStringPgm(SAPBRCLOSE);   // zamknij kontekst na wypadek błędu
-      delaySec(2);
-      sendStringPgm(SAPBROPEN);    // otwórz kontekst IP (GPRS attach)
-      delaySec(5);
-      sendStringPgm(SAPBRQUERY);   // sprawdź czy dostaliśmy adres IP
-      if (waitFor_P(SAPBRSUCC, sizeof(SAPBRSUCC), 1)) initialized = 1;
-      attempt++;
-    } while ((attempt < 3) && (initialized == 0));
-
-    if (initialized == 1) {
-      // GPRS działa - pobierz pozycję najbliższego BTS
-      delaySec(1);
-      sendStringPgm(CHECKGPS);
-      if (readCellGps()) {
-        // wyślij raport HTTP GET: API_URL?token=...&lat=<szer>&lon=<dług>
-        sendStringPgm(HTTPINIT);
-        delaySec(2);
-        sendStringPgm(HTTPPARA_CID);
-        delaySec(1);
-        sendStringPgm(HTTPURL);        // AT+HTTPPARA="URL","http://...?token=...&lat=
-        sendStringUart(latitude);
-        sendStringPgm(URL_LON);        // &lon=
-        sendStringUart(longtitude);
-        sendStringPgm(URL_END);        // "CRLF
-        delaySec(1);
-        sendStringPgm(HTTPACTION);     // wykonaj GET
-        // czekaj na URC +HTTPACTION: 0,<kod>,<długość> - do ~40s (8 timeoutów po 5s)
-        if (waitFor_P(ISHTTPOK, sizeof(ISHTTPOK), 8)) {
-          blinkStatus();               // serwer odpowiedział 200 - raport dostarczony
-        }
-        sendStringPgm(HTTPTERM);
-        delaySec(1);
+    if (getGnssFix()) {
+      // jest pozycja - upewnij się że sieć jest, wyślij raport
+      checkAttach();
+      if (sendReport()) {
+        blinkStatus();     // serwer potwierdził (HTTP 200)
       }
-      // zamknij kontekst IP
-      sendStringPgm(SAPBRCLOSE);
-      delaySec(2);
-    } else {
-      // GPRS nie wstał po 3 próbach - moduł mógł się zrestartować (np. spadek napięcia):
-      // przejdź pełną rekonfigurację od początku
-      checkAt();
-      checkPin();
-      checkRegistration();
-      provisionGprs();
     }
+    // brak fixu = pomiń ten cykl (spróbujemy za REPORT_INTERVAL_MIN minut)
 
-    // uśpij SIM800L i czekaj do następnego raportu
-    sendStringPgm(SLEEP_ON);
     for (m = 0; m < REPORT_INTERVAL_MIN; m++) {
       delaySec(60);
     }
-    // obudź moduł (dowolne znaki na UART + wyłączenie trybu uśpienia)
-    sendStringPgm(AT);
-    delaySec(1);
-    sendStringPgm(SLEEP_OFF);
-    delaySec(1);
   }
 }
